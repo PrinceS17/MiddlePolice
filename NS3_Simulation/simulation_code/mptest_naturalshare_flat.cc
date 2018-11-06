@@ -1,5 +1,6 @@
 /*
- * NaturalShare policy VS. Flat rate attack
+ * NaturalShare policy, test Mbox with 2 senders & 1 receiver
+ * MP policy realized in pktArrival of right router
  */
 
 #include <fstream>
@@ -21,25 +22,22 @@
 #include "ns3/flow-monitor-helper.h"
 #include "ns3/random-variable-stream.h"
 #include "ns3/udp-socket-factory.h"
+#include "ns3/tcp-socket-factory.h"
 #include "ns3/ipv4-flow-classifier.h"
 #include "ns3/point-to-point-net-device.h"
 
 #include <iostream>
 #include <iomanip>
+#include <vector>
 #include <map>
 #include <fstream>
+#include <cstdio>
 #include <ctime>
 #include <locale>
 #include <time.h>
 #include <stdlib.h>
 
-// Internet traffic
-#include "ns3/tmix.h"
-#include "ns3/tmix-helper.h"
-#include "ns3/delaybox-net-device.h"
-#include "ns3/tmix-topology.h"
-#include "ns3/tmix-ns2-style-trace-helper.h"
-
+using namespace std;
 using namespace ns3;
 
 /*
@@ -49,8 +47,8 @@ using namespace ns3;
 #define ARRAY_SIZE 1000
 
 std::string attackerDataRate = "30Mbps";
-std::string clientDataRate = "1Mbps";
-double period = 2.0;
+std::string clientDataRate = "0.5Mbps";
+double period = 1;                    // will it influence the cwnd / rwnd value?
 double duration = period / 1;
 uint16_t port = 5001;
 uint16_t attackerport = 5003;
@@ -62,9 +60,12 @@ std::ofstream droprateFile("dropRate.dat", std::ios::out);
 //std::ofstream rawdropFile ("rawDropRate.dat", std::ios::out);
 Ptr<Node> router;
 Ptr<PointToPointNetDevice> p2pDevice;
-uint32_t nLeaf = 4;
-uint32_t nAttacker = 4;
-int size = nLeaf + nAttacker;
+// uint32_t nLeaf = 4;
+// uint32_t nAttacker = 4;
+// int size = nLeaf + nAttacker;
+uint32_t nLeft = 2;  // # receiver
+uint32_t nRight = 2; // # senders
+
 double detectPeriod = 0.0;
 uint32_t lock = 0;
 uint32_t dropArray[ARRAY_SIZE];
@@ -85,9 +86,6 @@ double lossRateArray[ARRAY_SIZE];
 
 // Used for crossing traffic
 uint32_t nCrossing = 0;
-std::ifstream cvectFileA;
-std::ifstream cvectFileB;     // not realized in current version
-Ptr<DelayBox> m_delayBox = CreateObject<DelayBox>();
 
 // parameters
 double lossRateThreshold = 0.05;
@@ -95,6 +93,13 @@ double beta = 0.8;
 
 // for fairshare
 double total_capacity = 0;
+
+// for RTT record
+// vector< vector<double> > rtt;
+double ** rtt;
+int tagScale = 10000000;
+map<int, map<int, bool>> tagMap;
+vector<string> fileName;
 
 // for recording the congestion window
 std::ofstream windowFile("natural_flat_window.data", std::ios::out);
@@ -147,6 +152,7 @@ MyTag::GetSerializedSize(void) const
 void MyTag::Serialize(TagBuffer i) const
 {
   i.WriteU32(m_simpleValue);
+
 }
 void MyTag::Deserialize(TagBuffer i)
 {
@@ -197,6 +203,7 @@ private:
   bool m_running;
   //uint32_t        m_packetsSent;
   uint32_t m_tagValue;
+  uint32_t m_cnt;     // count of packet sent by this app
 };
 
 MyApp::MyApp()
@@ -208,7 +215,8 @@ MyApp::MyApp()
       m_sendEvent(),
       m_running(false),
       //m_packetsSent (0)
-      m_tagValue(0)
+      m_tagValue(0),
+      m_cnt(0)
 {
 }
 
@@ -266,7 +274,12 @@ void MyApp::SendPacket(void)
 {
   //create the tags
   MyTag tag;
-  tag.SetSimpleValue(m_tagValue);
+
+  // 2nd: add for tag for m_tagValue
+  // tag.SetSimpleValue(m_tagValue);
+  tag.SetSimpleValue(m_tagValue * tagScale + m_cnt);
+  rtt[m_tagValue][m_cnt ++] = Simulator::Now().GetSeconds();
+ 
 
   Ptr<Packet> packet = Create<Packet>(m_packetSize);
   packet->AddPacketTag(tag); //add tags
@@ -284,95 +297,31 @@ void MyApp::ScheduleTx(void)
   if (m_running)
   {
     Time tNext(Seconds(m_packetSize * 8 / static_cast<double>(m_dataRate.GetBitRate())));
+    // mark the count
     m_sendEvent = Simulator::Schedule(tNext, &MyApp::SendPacket, this);
   }
 }
-//=========================================================================//
-//===================End of Application definition=========================//
-//=========================================================================//
 
-//=========================================================================//
-//===================Internet Traffic Trace: NOT COMPLETED=================//
-//=========================================================================//
-// Choice one: distribute all traces to all crossing node pairs
-void
-//ReadAndAddCvecs(Ptr<TmixTopology> tmix, TmixTopology::InitiatorSide side, std::istream& cvecfile, double chance)
-ReadAndAddCvecs(std::istream &cvecfile, Ptr<Node> initiatorNode, Ipv4Address initiatorAddress,
-                Ptr<Node> acceptorNode, Ipv4Address acceptorAddress)
-{
-  //const int cvecsPerPair = 10000;
-  //TmixTopology::TmixNodePair pair = tmix->NewPair(side);
-  //SetTmixPairOptions(pair);
-  //int nPairs = 1;
-  Ptr<TmixHelper> helper = Create<TmixHelper>(m_delayBox, initiatorNode,
-                                              initiatorAddress, acceptorNode, acceptorAddress);
+// void attackFlow(PointToPointDumbbellHelper d, uint32_t nAttacker, double stopTime)
+// {
+//   for (uint32_t i = d.RightCount() - nAttacker; i < d.RightCount(); ++i)
+//   {
+//     Ptr<Socket> ns3Socket = Socket::CreateSocket(d.GetRight(i), UdpSocketFactory::GetTypeId());
 
-  int nCvecs = 0;
-  Tmix::ConnectionVector cvec;
-  while (Tmix::ParseConnectionVector(cvecfile, cvec) && ++nCvecs < 10000)
-  {
-    //std::cout << "reading\n";
-    helper->AddConnectionVector(cvec);
-    /*
-    if (UniformVariable().GetValue() < chance) {
-      pair.helper->AddConnectionVector(cvec);
-      if (++nCvecs >= cvecsPerPair)
-	{
-	  pair = tmix->NewPair(side);
-	  SetTmixPairOptions(pair);
-	  nCvecs = 0;
-	  nPairs++;
-	}
-    }*/
-  }
-  //NS_LOG_INFO("Read a total of " << ((nPairs-1)*cvecsPerPair + nCvecs) << " cvecs, distributing them to " << nPairs << " node pairs.");
-}
-
-//=========================================================================//
-//===================Callbacks: Scheduled events=========================//
-//=========================================================================//
-void measureDropRate(Ptr<FlowMonitor> flowmon, uint64_t start)
-{
-  std::map<FlowId, FlowMonitor::FlowStats> flowstat = flowmon->GetFlowStats();
-  for (std::map<FlowId, FlowMonitor::FlowStats>::iterator it = flowstat.begin(); it != flowstat.end(); ++it)
-  {
-    //pending
-    /*
-     * Catch attack flow
-    if (it->second.timeFirstTxPacket == NanoSeconds (start - 1000000000)){
-      std::cout << "catch \n";
-    }
-    */
-  }
-}
-
-void attackFlow(PointToPointDumbbellHelper d, uint32_t nAttacker, double stopTime)
-{
-  for (uint32_t i = d.RightCount() - nAttacker; i < d.RightCount(); ++i)
-  {
-    Ptr<Socket> ns3Socket = Socket::CreateSocket(d.GetRight(i), UdpSocketFactory::GetTypeId());
-
-    Address sinkAddress(InetSocketAddress(d.GetLeftIpv4Address(i), attackerport));
-    Ptr<MyApp> app = CreateObject<MyApp>();
-    uint32_t tagValue = i + 1; //take the least significant 8 bits
-    app->SetTagValue(tagValue);
-    app->Setup(ns3Socket, sinkAddress, 1000, DataRate(attackerDataRate));
-    d.GetRight(i)->AddApplication(app);
-    app->SetStartTime(Seconds(0.0));
-    app->SetStopTime(Seconds(duration));
-  }
-}
-//=========================================================================//
-//=========================================================================//
-//=========================================================================//
-
-//=========================================================================//
-//========================Add tracing source===============================//
-//=========================================================================//
+//     Address sinkAddress(InetSocketAddress(d.GetLeftIpv4Address(i), attackerport));
+//     Ptr<MyApp> app = CreateObject<MyApp>();
+//     uint32_t tagValue = i + 1; //take the least significant 8 bits
+//     app->SetTagValue(tagValue);
+//     app->Setup(ns3Socket, sinkAddress, 1000, DataRate(attackerDataRate));
+//     d.GetRight(i)->AddApplication(app);
+//     app->SetStartTime(Seconds(0.0));
+//     app->SetStopTime(Seconds(duration));
+//   }
+// }
 
 void clearArray()
 {
-  for (uint32_t j = 0; j < nLeaf + nAttacker; ++j)
+  for (uint32_t j = 0; j < nRight; ++j)
   {
     //std::cout << "client no: " << j << "; arrived: "<< receiveWin[j] << "; drop rate: " << 1.0 * dropArray[j] / receiveWin[j] << std::endl;
     receiveWin[j] = 0;
@@ -405,138 +354,141 @@ static void
 PktArrival(Ptr<const Packet> p)
 {
   Ptr<Packet> pktCopy = p->Copy();
-  //uint32_t totalNormal = nLeaf;
-  //uint32_t totalAttacker = nAttacker;
-
-  //Ptr<Queue> redQueue = p2pDevice -> GetQueue ();
-  //queueFile << Simulator::Now().GetSeconds() << "\t" << redQueue->GetNPackets() << "\n";
-  // flow table populating
   MyTag tag;
-  if (pktCopy->PeekPacketTag(tag))
+
+  if (pktCopy->PeekPacketTag(tag)) // if find a tag
   {
-    // update usage for each flow
-    uint32_t index = tag.GetSimpleValue() - 1;
+    // compatible with the setting
+    // uint32_t index = tag.GetSimpleValue() - 1;
+    uint32_t index = tag.GetSimpleValue() / tagScale;
+    uint32_t cnt = tag.GetSimpleValue() % tagScale;
+    
+    if(tagMap[index].find(cnt) == tagMap[index].end())
+    {
+      double tmp = Simulator::Now().GetSeconds() - rtt[index][cnt];
+      // cout << Simulator::Now().GetSeconds() << " " << index << ". " << cnt << " : " << rtt[index][cnt] << " s, " << tmp << " s. " << endl;
+      rtt[index][cnt] = tmp;
+      tagMap[index][cnt] = true;    // avoid repeated which I don't know why
+    }
+
     receiveWin[index] += 1;
 
-    // Almost realtime loss measurement
-    if (++realtimePeriod == realtimePacketFeedback)
+    if (++realtimePeriod == realtimePacketFeedback) // calculating a real-time loss rate every 50 packets
     {
-      realtimeLossRate = 1.0 * realtimeDrop / realtimePeriod;
-      //std::cout << "realtime loss: " << realtimeLossRate << std::endl;
+      realtimeLossRate = (double)realtimeDrop / realtimePeriod;
       realtimePeriod = 0;
       realtimeDrop = 0;
     }
 
-    // Best-effort handling
-    // Adding crossing traffic of bottleneck, which is not policed by MiddlePolice (tag between nLeaf-nCrossing, nLeaf)
     if (enableEarlyDrop > 0)
     {
-      //if (receiveWin[index] > congWin[index] && index > nLeaf-nCrossing && index <= nLeaf) { // best-effort
       if (receiveWin[index] > congWin[index])
-      { // best-effort packets
-        if ((realtimeLossRate > lossRateThreshold) || (lossRateArray[index] > lossRateThreshold))
+      {
+        if (realtimeLossRate > lossRateThreshold || lossRateArray[index] > lossRateThreshold)
         {
-          //if (slopingProb(realtimeLossRate) || slopingProb(lossRateArray[index])) {
           p2pDevice->SetEarlyDrop(true);
           realtimeDrop--;
+          cout << "Early drop!" << endl;
         }
       }
     }
   }
 
-  // larger time scale: per detection period
+  // filename[n] // should defined globally 
+  ofstream fout[nRight];
+  for(int i = 0; i < nRight; i ++)
+    fout[i].open(fileName[i], ios::out | ios::app);
+
   if (Simulator::Now().GetSeconds() > detectPeriod)
   {
-    std::cout << "detection period: " << bootStrap++ << std::endl;
+    cout << endl << Simulator::Now().GetSeconds() << "s detection period: " << bootStrap++ << endl;
     if (windowFile.is_open())
-    {
       windowFile << Simulator::Now().GetSeconds() << " ";
-    }
     if (lossRateFile.is_open())
       lossRateFile << Simulator::Now().GetSeconds() << " ";
 
-    for (uint32_t j = 0; j < nLeaf + nAttacker; ++j)
+    for (uint32_t j = 0; j < nRight; j++)
     {
+      // loss rate & cwnd update
+      double lossRate = receiveWin[j] > 0 ? (double)dropArray[j] / receiveWin[j] : 0.0;
+      lossRateArray[j] = receiveWin[j] > 5 ? (1 - beta) * lossRate + beta * lossRateArray[j]
+                                           : beta * lossRateArray[j]; // ??
+      congWin[j] = receiveWin[j] >= dropArray[j] ? receiveWin[j] - dropArray[j] : 0;
 
-      double lossRate = receiveWin[j] > 0 ? 1.0 * dropArray[j] / receiveWin[j] : 0.0;
-
-      if (receiveWin[j] > 5)
-      {
-        lossRateArray[j] = (1 - beta) * lossRate + beta * lossRateArray[j];
-      }
-      else
-      {
-        lossRateArray[j] = beta * lossRateArray[j];
-      }
-
-      if (receiveWin[j] >= dropArray[j])
-        congWin[j] = (receiveWin[j] - dropArray[j]);
-      else
-        congWin[j] = 0;
-
+      // output to file & stdout
       if (windowFile.is_open())
-      {
         windowFile << congWin[j] << " ";
-      }
-
       if (lossRateFile.is_open())
         lossRateFile << lossRateArray[j] << " ";
+      cout << "Client No." << j << "; cwnd: " << congWin[j] << "; loss rate: " << lossRateArray[j]
+           << "; rwnd: " << receiveWin[j] << "; drop window: " << dropArray[j]
+           << "; realtime loss: " << realtimeLossRate << endl;
+      // fout[j] << Simulator::Now().GetSeconds() << " " << congWin[j] << endl;
+      fout[j] << Simulator::Now().GetSeconds() << " " << congWin[j] / period << endl;   // output the ephermal data rate (omit pkt size 1kbit)
 
-      std::cout << "Client NO." << j << "; congestion window: " << congWin[j] << "; loss rate: " << lossRateArray[j] << "; receive window: " << receiveWin[j] << "; drop window: " << dropArray[j] << "; realtime loss: " << realtimeLossRate << std::endl;
     }
-
     if (windowFile.is_open())
-    {
-      windowFile << "\n";
-    }
+      windowFile << endl;
     if (lossRateFile.is_open())
-      lossRateFile << "\n";
-
-    // update for the next period
-    detectPeriod += period;
+      lossRateFile << endl;
+    detectPeriod += period; // update for next period
     clearArray();
   }
+
+  // close the file
+  for(int i = 0; i < nRight; i ++)
+    fout[i].close();
 }
 
 static void
 PktDrop(Ptr<const Packet> p)
 {
   realtimeDrop += 1;
-  //std::cout << "Dropping count " << realtimeDrop << std::endl;
   MyTag tag;
   if (p->PeekPacketTag(tag))
-  {
     dropArray[tag.GetSimpleValue() - 1] += 1;
-  }
+  cout << "Drop packet!" << endl;
 }
 
 static void
 PktDropOverflow(Ptr<const Packet> p)
 {
-  std::cout << "Dropping for overflow" << std::endl;
+  cout << "Dropping for overflow" << endl;
 }
-
-//=========================================================================//
-//=========================================================================//
-//=========================================================================//
 
 //===========================Main Function=============================//
 int main(int argc, char *argv[])
 {
-  uint32_t maxPackets = 250; // The queue buffer size
+  uint32_t maxPackets = 250;
   uint32_t modeBytes = 0;
   double minTh = 100;
   double maxTh = 200;
   uint32_t pktSize = 1000;
-  double stopTime = 2.5;
+  double stopTime = 30;
 
-  std::string appDataRate = "1Mbps";
-  //std::string queueType = "DropTail";
-  std::string queueType = "RED";
-  std::string bottleNeckLinkBw = "10Mbps";
-  std::string bottleNeckLinkDelay = "200ms";
-  std::string attackFlowType = "ns3::UdpSocketFactory";
+  string appDataRate = "1Mbps";   // no use here
+  string queueType = "DropTail";
+  string bottleNeckLinkBw = "1Mbps";
+  string bottleNeckLinkDelay = "200ms";
+  string attackFlowType = "ns3:TcpSocketFactory"; // if we need here?
+
+  // just copy the original below
   std::string mtu = "1599";
+
+  // define the file names here
+  ofstream fout[nRight];
+  for(int i = 0; i < nRight; i ++)
+  {
+    fileName.push_back("wndOutput_" + to_string(i) + ".dat");
+    remove(fileName[i].c_str());
+  }
+
+  // allocate space for rtt
+  rtt = new double*[max(nLeft, nRight)];
+  for(int i = 0; i < max(nLeft, nRight); i ++)
+  {
+    rtt[i] = new double [10000];    // easy to overflow
+  }
 
   //get the local time
   std::time_t t = std::time(NULL);
@@ -544,14 +496,14 @@ int main(int argc, char *argv[])
   std::strftime(localTime, 100, "%c", std::localtime(&t));
 
   CommandLine cmd;
-  cmd.AddValue("nLeaf", "Number of left and right side leaf nodes", nLeaf);
+  cmd.AddValue("nLeft", "Number of left side nodes", nLeft);
   cmd.AddValue("enableEarlyDrop", "enableEarlyDrop", enableEarlyDrop);
   cmd.AddValue("attackerDataRate", "attack data rate", attackerDataRate);
   cmd.AddValue("clientDataRate", "legitimate users data rate", clientDataRate);
   cmd.AddValue("bottleNeckLinkBw", "bottle neck link bandwidth", bottleNeckLinkBw);
   cmd.AddValue("stopTime", "Stopping time for simulation", stopTime);
   cmd.AddValue("attackFlowType", "Type of attacking flows", attackFlowType);
-  cmd.AddValue("nAttacker", "Number of TCP attacking flows", nAttacker);
+  cmd.AddValue("nRight", "Number of TCP attacking flows", nRight);
   cmd.AddValue("maxPackets", "Max Packets allowed in the queue", maxPackets);
   cmd.AddValue("queueType", "Set Queue type to DropTail or RED", queueType);
   cmd.AddValue("appDataRate", "Set OnOff App DataRate", appDataRate);
@@ -576,22 +528,25 @@ int main(int argc, char *argv[])
   Config::SetDefault("ns3::TcpL4Protocol::SocketType", StringValue("ns3::TcpNewReno"));
   //Config::SetDefault ("ns3::OnOffApplication::DataRate", StringValue (appDataRate));
 
-  if (modeBytes)
-  {
-    Config::SetDefault("ns3::DropTailQueue::Mode", StringValue("QUEUE_MODE_PACKETS"));
-    Config::SetDefault("ns3::DropTailQueue::MaxPackets", UintegerValue(maxPackets));
-    Config::SetDefault("ns3::RedQueue::Mode", StringValue("QUEUE_MODE_PACKETS"));
-    Config::SetDefault("ns3::RedQueue::QueueLimit", UintegerValue(maxPackets));
-  }
-  else
-  {
-    Config::SetDefault("ns3::DropTailQueue::Mode", StringValue("QUEUE_MODE_BYTES"));
-    Config::SetDefault("ns3::DropTailQueue::MaxBytes", UintegerValue(maxPackets * pktSize));
-    Config::SetDefault("ns3::RedQueue::Mode", StringValue("QUEUE_MODE_BYTES"));
-    Config::SetDefault("ns3::RedQueue::QueueLimit", UintegerValue(maxPackets * pktSize));
-    minTh *= pktSize;
-    maxTh *= pktSize;
-  }
+  // if (modeBytes)
+  // {
+  //   Config::SetDefault("ns3::DropTailQueue::Mode", StringValue("QUEUE_MODE_PACKETS"));
+  //   Config::SetDefault("ns3::DropTailQueue::MaxPackets", UintegerValue(maxPackets));
+  //   Config::SetDefault("ns3::RedQueue::Mode", StringValue("QUEUE_MODE_PACKETS"));
+  //   Config::SetDefault("ns3::RedQueue::QueueLimit", UintegerValue(maxPackets));
+  // }
+  // else
+  // {
+  //   Config::SetDefault("ns3::DropTailQueue::Mode", StringValue("QUEUE_MODE_BYTES"));
+  //   Config::SetDefault("ns3::DropTailQueue::MaxBytes", UintegerValue(maxPackets * pktSize));
+  //   Config::SetDefault("ns3::RedQueue::Mode", StringValue("QUEUE_MODE_BYTES"));
+  //   Config::SetDefault("ns3::RedQueue::QueueLimit", UintegerValue(maxPackets * pktSize));
+  //   minTh *= pktSize;
+  //   maxTh *= pktSize;
+  // }
+
+  minTh *= pktSize;
+  maxTh *= pktSize;
 
   //===================Create network topology===========================//
   // Need to create three links for this topo
@@ -619,17 +574,16 @@ int main(int argc, char *argv[])
 
   // Dumbbell constructor: nLeaf normal flows and nAttacker attack flows
   /// left nodes <-> router <-> router <-> right nodes, like the shape of dumpbell
-  PointToPointDumbbellHelper d(nLeaf + nAttacker, pointToPointLeaf,
-                               nLeaf + nAttacker, pointToPointLeaf,
-                               bottleNeckLink);
+
+  PointToPointDumbbellHelper d1(nLeft, pointToPointLeaf, nRight, pointToPointLeaf, bottleNeckLink);
 
   // Install Stack to the whole nodes
   InternetStackHelper stack;
-  d.InstallStack(stack);
+  d1.InstallStack(stack);
 
   // Assign IP Addresses
   // Three sets of address: the left, the right and the router
-  d.AssignIpv4Addresses(Ipv4AddressHelper("10.1.0.0", "255.255.255.252"),
+  d1.AssignIpv4Addresses(Ipv4AddressHelper("10.1.0.0", "255.255.255.252"),
                         Ipv4AddressHelper("11.1.0.0", "255.255.255.252"),
                         Ipv4AddressHelper("12.1.0.0", "255.255.255.252"));
 
@@ -647,43 +601,20 @@ int main(int argc, char *argv[])
   /* what's the difference of packet sink & cross sink ? packet sink is what we care?*/
   // create the package sink application, which means that the endpoint will receive packets using certain protocols
   PacketSinkHelper packetSinkHelper("ns3::TcpSocketFactory", sinkLocalAddress);
-  PacketSinkHelper crossSinkHelper("ns3::TcpSocketFactory", sinkLocalAddress);
-  PacketSinkHelper attackerPacketSinkHelper(attackFlowType, attackerSinkLocalAddress);
 
   // Create the normal TCP flows sink applications
   ApplicationContainer sinkApps;
-  //for (uint32_t i = 0; i < d.LeftCount () - nAttacker; ++i)
-  for (uint32_t i = 0; i < d.LeftCount() - nAttacker - nCrossing; ++i)
+  //for (uint32_t i = 0; i < d1.LeftCount () - nAttacker; ++i)
+  for (uint32_t i = 0; i < d1.LeftCount(); ++i)
   {
     // packetSinkHelper.Install (node): install the sink app on this node   /// which is tcp on sink local addr
     // sinkApps.add (app): add one single application to the container
-    sinkApps.Add(packetSinkHelper.Install(d.GetLeft(i)));
-  }
-
-  // Create the Internet traffic application
-  ApplicationContainer internetTrafficApps;
-  for (uint32_t i = d.LeftCount() - nAttacker - nCrossing; i < d.LeftCount() - nAttacker; ++i)
-  {
-    // Realistic Internet traffic       /// which is also tcp on sink local addr, but # nodes is nCrossing
-    internetTrafficApps.Add(crossSinkHelper.Install(d.GetLeft(i)));
-  }
-
-  // Create the attack flow sink application
-  ApplicationContainer attackerSinkApps;
-  for (uint32_t j = d.LeftCount() - nAttacker; j < d.LeftCount(); ++j)
-  {
-    attackerSinkApps.Add(attackerPacketSinkHelper.Install(d.GetLeft(j)));
+    sinkApps.Add(packetSinkHelper.Install(d1.GetLeft(i)));
   }
 
   // Arrange all application in the container to start and stop
   sinkApps.Start(Seconds(0.0));
   sinkApps.Stop(Seconds(stopTime));
-  attackerSinkApps.Start(Seconds(0.0));
-  attackerSinkApps.Stop(Seconds(stopTime));
-
-  // add for the internet traffic
-  internetTrafficApps.Start(Seconds(0.0));
-  internetTrafficApps.Stop(Seconds(stopTime));
 
   //==========================================================================//
   //======================End of sink applications============================//
@@ -692,37 +623,24 @@ int main(int argc, char *argv[])
   //==========================================================================//
   //================Creating the normal client applications===================//
   //==========================================================================//
-  for (uint32_t i = 0; i < d.RightCount() - nAttacker - nCrossing; ++i)
+  
+  for (uint32_t i = 0; i < d1.RightCount(); ++i)
   {
-    Ptr<Socket> ns3Socket = Socket::CreateSocket(d.GetRight(i), TcpSocketFactory::GetTypeId());
+    Ptr<Socket> ns3Socket = Socket::CreateSocket(d1.GetRight(i), TcpSocketFactory::GetTypeId());
 
-    Address sinkAddress(InetSocketAddress(d.GetLeftIpv4Address(i), port)); /// send to i th left node
+    Address sinkAddress(InetSocketAddress(d1.GetLeftIpv4Address(i % nLeft), port)); /// send to i th left node, map right node to left node
     Ptr<MyApp> app = CreateObject<MyApp>();
-    uint32_t tagValue = i + 1; //take the least significant 8 bits
+    uint32_t tagValue = i ; //take the least significant 8 bits
+    
+    // 2nd line for idtentify each packet to get the RTT
     app->SetTagValue(tagValue);
-    app->Setup(ns3Socket, sinkAddress, 1000, DataRate(clientDataRate));
-    d.GetRight(i)->AddApplication(app);
+    tagMap[i] = map<int, bool> ();
+
+    app->Setup(ns3Socket, sinkAddress, pktSize, DataRate(clientDataRate));
+    d1.GetRight(i)->AddApplication(app);
     app->SetStartTime(Seconds(0));
     app->SetStopTime(Seconds(stopTime));
   }
-  //==========================================================================//
-  //==================End of normal client applications=======================//
-  //==========================================================================//
-
-  //==========================================================================//
-  //======================Creating crossing traffic===========================//
-  //==========================================================================//
-  cvectFileA.open("scratch/outbound.ns");
-  cvectFileB.open("scratch/inbound.ns"); /// inbound.ns: what's this? realistic network crossing traffic?
-  for (uint32_t i = d.RightCount() - nAttacker - nCrossing; i < d.RightCount() - nAttacker; ++i)
-  {
-    //ReadAndAddCvecs(cvectFileA, d.GetRight(i), d.GetRightIpv4Address(i), d.GetLeft(i), d.GetLeftIpv4Address(i));
-    //ReadAndAddCvecs(cvectFileB, d.GetLeft(i), d.GetLeftIpv4Address(i), d.GetRight(i), d.GetRightIpv4Address(i));
-  }
-  //==========================================================================//
-  //======================End crossing traffic===========================//
-  //==========================================================================//
-
   //==========================================================================//
   //==================End of normal client applications=======================//
   //==========================================================================//
@@ -737,36 +655,22 @@ int main(int argc, char *argv[])
 
   //==========================================================================//
 
-  //==========================================================================//
-  //================Creating the attack client applications===================//
-  //==========================================================================//
-  double start = 0.1;
-  for (; start < stopTime; start += period)
-  {
-    //Simulator::Schedule(Seconds (start), &measureDropRate, flowmon, start);
-    //Simulator::Schedule(Seconds (0.0), &attackFlow, d, nAttacker, stopTime);
-    Simulator::Schedule(Seconds(start), &attackFlow, d, nAttacker, stopTime);
-  }
-
-  for (uint32_t j = 0; j < nLeaf + nAttacker; ++j)
+  for (uint32_t j = 0; j < nRight; ++j)
   {
     dropArray[j] = 0;
     congWin[j] = 0;
     receiveWin[j] = 0;
     lossRateArray[j] = 0;
   }
-  //==========================================================================//
-  //======================End of attacking applications=======================//
-  //==========================================================================//
 
   //=============================Trace source============================//
-  router = d.GetRight();
-  Ptr<Node> rightRouter = d.GetRight();
+  router = d1.GetRight();
+  Ptr<Node> rightRouter = d1.GetRight();
   //std::cout << "number of devices: " << rightRouter->GetNDevices() << std::endl;
   for (uint32_t i = 0; i < rightRouter->GetNDevices(); ++i)
   {
     // Find the bottleneck device (p2p device)
-    if ((rightRouter->GetDevice(i)->GetMtu()) == mmtu)
+    if ((rightRouter->GetDevice(i)->GetMtu()) == mmtu)      // don
     {                                                                 /// get mtu = mmtu: what's that mean
       bottleNeckLink.EnablePcap("router", rightRouter->GetDevice(i)); /// PCAP: a binary format for packet capture
       rightRouter->GetDevice(i)->TraceConnectWithoutContext("MacTx", MakeCallback(&PktArrival));
@@ -795,42 +699,23 @@ int main(int argc, char *argv[])
 
   for (uint32_t i = 0; i < sinkApps.GetN(); i++)
   {
-    if (i < nLeaf - nCrossing)
-    { /// number of packet we care about
-      Ptr<Application> app = sinkApps.Get(i);
-      // PacketSink: receive and consume the traffic generated to the IP address and port
-      Ptr<PacketSink> pktSink = DynamicCast<PacketSink>(app);
-
-      // GetTotalRx: total bytes received in a sink app
-      double bytes = 1.0 * pktSink->GetTotalRx() * 8 / 1000000; /// why multiply by 8?
-      totalCounter += bytes;
-      clientCounter += bytes;
-      clientCounterSquare += (bytes * bytes); /// -> used to compute client index below
-      totalCounterSquare += (bytes * bytes);
-    }
-  }
-
-  //Attack flows
-  double attackerCounter = 0;
-  double attackerCounterSquare = 0;
-  for (uint32_t j = 0; j < attackerSinkApps.GetN(); j++)
-  {
-    Ptr<Application> app = attackerSinkApps.Get(j);
+    /// number of packet we care about
+    Ptr<Application> app = sinkApps.Get(i);
     // PacketSink: receive and consume the traffic generated to the IP address and port
     Ptr<PacketSink> pktSink = DynamicCast<PacketSink>(app);
 
     // GetTotalRx: total bytes received in a sink app
-    double bytes = 1.0 * pktSink->GetTotalRx() * 8 / 1000000;
-    attackerCounter += bytes;
+    double bytes = 1.0 * pktSink->GetTotalRx() * 8 / 1000000; /// why multiply by 8?
     totalCounter += bytes;
+    clientCounter += bytes;
+    clientCounterSquare += (bytes * bytes); /// -> used to compute client index below
     totalCounterSquare += (bytes * bytes);
-    attackerCounterSquare += (bytes * bytes);
   }
 
-  double normalAverageRate = nLeaf == 0 ? 0 : clientCounter / Simulator::Now().GetSeconds() / (nLeaf - nCrossing);
-  double client_index = clientCounter * clientCounter / clientCounterSquare / nLeaf;
-  double attackerAverageRate = nAttacker == 0 ? 0 : attackerCounter / Simulator::Now().GetSeconds() / nAttacker;
-  double total_index = totalCounter * totalCounter / totalCounterSquare / nLeaf; /// what's the meaning?
+  double normalAverageRate = clientCounter / Simulator::Now().GetSeconds() / nRight;
+  double client_index = clientCounter * clientCounter / clientCounterSquare / nRight;
+  // double attackerAverageRate = nAttacker == 0 ? 0 : attackerCounter / Simulator::Now().GetSeconds() / nAttacker;
+  double total_index = totalCounter * totalCounter / totalCounterSquare / nRight; /// what's the meaning?
 
   //output to a file
   std::ofstream outputFile("samerate", std::ios::out | std::ios::app);
@@ -847,8 +732,8 @@ int main(int argc, char *argv[])
                << "\nAttacker data rate: " << attackerDataRate
                << "\nLegitimate data rate: " << clientDataRate
                << "\nEnable early drop " << enableEarlyDrop
-               << "\nNumber of attackers: " << nAttacker
-               << "\nNumber of normal users: " << nLeaf - nCrossing
+               << "\nNumber of attackers: " << 0
+               << "\nNumber of normal users: " << nRight
                << "\nNumber of crossing users: " << nCrossing
                << "\nQueue Type: " << queueType
                << "\nAttack period: " << period << ", attack duration: " << duration
@@ -860,8 +745,8 @@ int main(int argc, char *argv[])
                //<< totalRxBytesCounter
                << "\nNormal Averaged Flows Rate: "
                << normalAverageRate << " Mbps"
-               << "\nAttack Averaged Flow Rate: "
-               << attackerAverageRate << " Mbps"
+               << "\nAttack Averaged Flow Rate: 0"
+              //  << attackerAverageRate << " Mbps"
                << "\nClient fairness index: "
                << client_index
                << "\nTotal fairness index: "

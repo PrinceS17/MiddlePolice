@@ -1,8 +1,0 @@
-
--------------------------- Update 11.6.2018 by Jinhui Song ------------------------------
-Slightly modify the patch for ns-3.29.
-
--------------------------- Original -----------------------------------------------------
-To support selective packet dropping at the mbox, I add a patch to the original ns-3 (version 3.21) source code. Specifically, I added an public interface named 'void SetEarlyDrop(bool flag)' for point-to-point-net-device. When a device call this interface with a True flag, it will drop the current packet. Further, the function also hooks up the trace. 
-
-Please replace these two files when running the simulation code. These files are located in 'src/point-to-point/model' of ns-3.21. 
